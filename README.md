@@ -44,6 +44,21 @@ iCloud+ 开通与礼品卡付款准备见 [开通流程](docs/icloud-purchase.md
 程序默认使用公共 anisette 服务池。设备标识及 provisioning 数据会发送给选用的 anisette 服务；
 账号密码和验证码由本程序直接提交 Apple 的登录接口。
 
+### 构建家庭与激活辅助程序
+
+面板的家庭状态查询需要 `bin/familyinspect.exe`，激活流程还需要
+`bin/accountsetupcheck.exe` 和 `bin/nacexchange.exe`。构建主程序时应一起构建这些辅助程序：
+
+```powershell
+. 'D:\APP\.runtime\appleservices-family-private\environment.ps1'
+go build -trimpath -o .\bin\familyinspect.exe ./tools/familyinspect
+go build -trimpath -o .\bin\accountsetupcheck.exe ./tools/accountsetupcheck
+go build -trimpath -o .\bin\nacexchange.exe ./tools/nacexchange
+```
+
+一键启动会检查上述文件，已运行的后台也会在执行家庭操作时检查它们。
+仅补齐这些辅助程序后可以直接重试，不必重启账号。
+
 ### 构建 Store 认证组件
 
 面板的 iCloud+ 购买预检查需要 `bin/storeauth.exe`。在项目目录运行：
