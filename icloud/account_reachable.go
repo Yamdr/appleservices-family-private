@@ -3,8 +3,6 @@ package icloud
 import (
 	"bytes"
 	"context"
-	"crypto/pbkdf2"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -25,6 +23,7 @@ import (
 var ErrAccountManagementAuthenticationRequired = errors.New("Apple Account management authentication required")
 
 type AppleAccountClient struct {
+	questions     SecurityQuestionsProvider
 	appleID       string
 	sessionPath   string
 	http          *http.Client
@@ -36,6 +35,10 @@ type AppleAccountClient struct {
 	pendingVerify json.RawMessage
 	lastStage     string
 	lastHTTP      int
+}
+
+func (c *AppleAccountClient) SetSecurityQuestionsProvider(provider SecurityQuestionsProvider) {
+	c.questions = provider
 }
 
 type savedAppleAccountSession struct {
@@ -281,8 +284,7 @@ func (c *AppleAccountClient) Authenticate(ctx context.Context, password string, 
 	if saltErr != nil || bErr != nil {
 		return errors.New("Apple Account SRP challenge encoding was invalid")
 	}
-	passwordHash := sha256.Sum256([]byte(password))
-	passwordKey, keyErr := pbkdf2.Key(sha256.New, string(passwordHash[:]), salt, challenge.Iteration, 32)
+	passwordKey, keyErr := deriveWebPasswordKey(password, challenge.Protocol, salt, challenge.Iteration)
 	if keyErr != nil {
 		return keyErr
 	}
@@ -297,11 +299,15 @@ func (c *AppleAccountClient) Authenticate(ctx context.Context, password string, 
 	}
 	completeBody, _ := json.Marshal(map[string]any{"accountName": c.appleID, "rememberMe": false, "trustTokens": []string{}, "m1": base64.StdEncoding.EncodeToString(m1), "c": state.srpSession, "m2": base64.StdEncoding.EncodeToString(m2)})
 	c.lastStage = "srp-complete"
-	response, _, err = c.authRequest(ctx, state, http.MethodPost, authBase+"/signin/complete?isRememberMeEnabled=false", completeBody, c.authHeaders(state))
+	response, completeData, err := c.authRequest(ctx, state, http.MethodPost, authBase+"/signin/complete?isRememberMeEnabled=false", completeBody, c.authHeaders(state))
 	if err != nil {
 		return err
 	}
-	if response.StatusCode == http.StatusConflict {
+	if securityQuestionChallenge(response.StatusCode, completeData) {
+		if err := answerSecurityQuestions(ctx, authBase, state, c.authRequest, c.authHeaders, c.questions); err != nil {
+			return err
+		}
+	} else if response.StatusCode == http.StatusConflict {
 		if codeProvider == nil {
 			return ErrAccountManagementAuthenticationRequired
 		}

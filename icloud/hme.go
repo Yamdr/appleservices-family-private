@@ -3,9 +3,7 @@ package icloud
 import (
 	"bytes"
 	"context"
-	"crypto/pbkdf2"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -77,6 +75,8 @@ type hmeSession struct {
 }
 
 type HideMyEmailClient struct {
+	questions   SecurityQuestionsProvider
+	serviceName string // empty preserves the Hide My Email service
 	appleID     string
 	sessionPath string
 	authBase    string
@@ -84,6 +84,10 @@ type HideMyEmailClient struct {
 	http        *http.Client
 	jar         http.CookieJar
 	session     hmeSession
+}
+
+func (c *HideMyEmailClient) SetSecurityQuestionsProvider(provider SecurityQuestionsProvider) {
+	c.questions = provider
 }
 
 // NewHideMyEmailClient creates an account-bound client. Web cookies are kept
@@ -177,6 +181,7 @@ func (c *HideMyEmailClient) saveSession() error {
 }
 
 type hmeAuthState struct {
+	fdClientInfo                   string
 	frameID, clientID, srpSession  string
 	authAttributes, sessionID      string
 	scnt, sessionToken, trustToken string
@@ -231,11 +236,16 @@ func (c *HideMyEmailClient) authHeaders(state *hmeAuthState) http.Header {
 	h.Set("X-Apple-Locale", "zh_CN")
 	h.Set("X-Apple-Offer-Security-Upgrade", "1")
 	h.Set("X-Apple-Privacy-Consent", "true")
-	h.Set("X-Apple-I-FD-Client-Info", hmeFDClientInfo())
+	if state.fdClientInfo == "" {
+		state.fdClientInfo = hmeFDClientInfo()
+	}
+	h.Set("X-Apple-I-FD-Client-Info", state.fdClientInfo)
 	h.Set("X-Requested-With", "XMLHttpRequest")
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "application/json")
-	h.Set("Origin", c.authBase)
+	if authURL, err := url.Parse(c.authBase); err == nil {
+		h.Set("Origin", authURL.Scheme+"://"+authURL.Host)
+	}
 	h.Set("Referer", c.authBase+"/")
 	h.Set("User-Agent", hmeWebUserAgent)
 	return h
@@ -307,8 +317,8 @@ func (c *HideMyEmailClient) authenticate(ctx context.Context, password string, c
 		return errors.New("hide my email web login requires the current account password")
 	}
 	c.resetHTTP()
-	state := &hmeAuthState{frameID: randomHex(16), clientID: hmeOAuthClient}
-	query := url.Values{"frame_id": {"auth-" + state.frameID}, "language": {"en_US"}, "skVersion": {"7"}, "iframeId": {"auth-" + state.frameID}, "client_id": {state.clientID}, "redirect_uri": {"https://www.icloud.com"}, "response_type": {"code"}, "response_mode": {"web_message"}, "state": {"auth-" + state.frameID}, "authVersion": {"latest"}}
+	state := &hmeAuthState{frameID: "auth-" + randomHex(16), clientID: hmeOAuthClient}
+	query := url.Values{"frame_id": {state.frameID}, "language": {"en_US"}, "skVersion": {"7"}, "iframeId": {state.frameID}, "client_id": {state.clientID}, "redirect_uri": {"https://www.icloud.com"}, "response_type": {"code"}, "response_mode": {"web_message"}, "state": {state.frameID}, "authVersion": {"latest"}}
 	startHeaders := make(http.Header)
 	startHeaders.Set("Accept", "*/*")
 	startHeaders.Set("User-Agent", hmeWebUserAgent)
@@ -327,8 +337,11 @@ func (c *HideMyEmailClient) authenticate(ctx context.Context, password string, c
 	srpClient := srp.NewClient(params, c.appleID)
 	initBody, _ := json.Marshal(map[string]any{"a": base64.StdEncoding.EncodeToString(srpClient.PublicA().Bytes()), "accountName": c.appleID, "protocols": []string{"s2k", "s2k_fo"}})
 	response, initData, err := c.authRequest(ctx, state, http.MethodPost, c.authBase+"/signin/init", initBody, c.authHeaders(state))
-	if err != nil || response.StatusCode < 200 || response.StatusCode >= 300 {
+	if err != nil {
 		return errors.New("Apple web SRP challenge failed")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("SRP init: %w", primaryMailLoginError(response.StatusCode, initData))
 	}
 	var challenge struct {
 		Iteration            int `json:"iteration"`
@@ -343,8 +356,7 @@ func (c *HideMyEmailClient) authenticate(ctx context.Context, password string, c
 	if saltErr != nil || bErr != nil {
 		return errors.New("Apple web SRP challenge encoding was invalid")
 	}
-	passwordHash := sha256.Sum256([]byte(password))
-	passwordKey, keyErr := pbkdf2.Key(sha256.New, string(passwordHash[:]), salt, challenge.Iteration, 32)
+	passwordKey, keyErr := deriveWebPasswordKey(password, challenge.Protocol, salt, challenge.Iteration)
 	if keyErr != nil {
 		return keyErr
 	}
@@ -358,11 +370,24 @@ func (c *HideMyEmailClient) authenticate(ctx context.Context, password string, c
 		return proofErr
 	}
 	completeBody, _ := json.Marshal(map[string]any{"accountName": c.appleID, "rememberMe": true, "trustTokens": []string{}, "m1": base64.StdEncoding.EncodeToString(m1), "c": state.srpSession, "m2": base64.StdEncoding.EncodeToString(m2)})
-	response, _, err = c.authRequest(ctx, state, http.MethodPost, c.authBase+"/signin/complete?isRememberMeEnabled=true", completeBody, c.authHeaders(state))
+	response, completeData, err := c.authRequest(ctx, state, http.MethodPost, c.authBase+"/signin/complete?isRememberMeEnabled=true", completeBody, c.authHeaders(state))
 	if err != nil {
 		return err
 	}
-	if response.StatusCode == http.StatusConflict {
+	if securityQuestionChallenge(response.StatusCode, completeData) {
+		if err := answerSecurityQuestions(ctx, c.authBase, state, c.authRequest, c.authHeaders, c.questions); err != nil {
+			return err
+		}
+	} else if response.StatusCode == http.StatusConflict {
+		if c.serviceName == "mccgateway" {
+			var challenge struct {
+				AuthType string `json:"authType"`
+			}
+			_ = json.Unmarshal(completeData, &challenge)
+			if challenge.AuthType != "hsa2" {
+				return errors.New("Apple 要求额外账号验证（如安全提示问题），请先在 iCloud.com/mail 完成验证后重新连接")
+			}
+		}
 		if codeProvider == nil {
 			return ErrHMEAuthenticationRequired
 		}
@@ -386,6 +411,9 @@ func (c *HideMyEmailClient) authenticate(ctx context.Context, password string, c
 			return errors.New("Apple rejected the trusted-device verification code")
 		}
 	} else if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if c.serviceName == "mccgateway" {
+			return primaryMailLoginError(response.StatusCode, completeData)
+		}
 		return errors.New("Apple web credentials were rejected")
 	}
 	response, _, err = c.authRequest(ctx, state, http.MethodGet, c.authBase+"/2sv/trust", nil, c.authHeaders(state))
@@ -418,6 +446,7 @@ type hmeAccountLoginResult struct {
 	DSInfo struct {
 		DSID         string `json:"dsid"`
 		LanguageCode string `json:"languageCode"`
+		AppleID      string `json:"appleId"`
 	} `json:"dsInfo"`
 	Webservices map[string]struct {
 		URL string `json:"url"`
@@ -452,10 +481,22 @@ func (c *HideMyEmailClient) accountLogin(ctx context.Context, state *hmeAuthStat
 			return errors.New("Apple 未确认 iCloud Web 条款接受状态")
 		}
 	}
-	if result.Webservices["premiummailsettings"].URL == "" {
+	serviceName := c.serviceName
+	if serviceName == "" {
+		serviceName = "premiummailsettings"
+	}
+	// Already-provisioned legacy mailboxes need only the mail service. Do not
+	// fail their existence check merely because creation is unavailable.
+	if serviceName == "mccgateway" && result.Webservices[serviceName].URL == "" && result.Webservices["mail"].URL != "" {
+		serviceName = "mail"
+	}
+	if result.Webservices[serviceName].URL == "" {
+		if serviceName == "mccgateway" {
+			return errors.New("Apple 未提供 iCloud 邮箱创建服务，请在 iCloud.com/mail 检查账号资格")
+		}
 		return errors.New("iCloud+ Hide My Email is unavailable for this account")
 	}
-	c.session = hmeSession{AppleID: c.appleID, DSID: result.DSInfo.DSID, ClientID: randomHex(16), ServiceURL: strings.TrimRight(result.Webservices["premiummailsettings"].URL, "/"), AccountCountry: state.accountCountry}
+	c.session = hmeSession{AppleID: c.appleID, DSID: result.DSInfo.DSID, ClientID: randomHex(16), ServiceURL: strings.TrimRight(result.Webservices[serviceName].URL, "/"), AccountCountry: state.accountCountry}
 	serviceURL, _ := url.Parse(c.session.ServiceURL)
 	if err := validateHMEWebCookies(c.jar.Cookies(serviceURL)); err != nil {
 		return err

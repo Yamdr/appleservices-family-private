@@ -57,6 +57,20 @@ func (s fileStore) LoadSession() (*appleservices.Session, error) {
 
 func (s fileStore) SaveSession(sess *appleservices.Session) error {
 	if sess == nil {
+		for _, name := range []string{"security-answers.dpapi", "security-questions-status.json"} {
+			if err := os.Remove(filepath.Join(s.dir, name)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
+		}
+		if err := s.ForgetLoginPassword(); err != nil {
+			return err
+		}
+		if err := os.Remove(filepath.Join(s.dir, "store-session.dpapi")); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Remove(s.acceptedPath()); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 		if err := os.Remove(s.sessionPath()); err != nil && !os.IsNotExist(err) {
 			return err
 		}
@@ -66,6 +80,40 @@ func (s fileStore) SaveSession(sess *appleservices.Session) error {
 		return err
 	}
 	return writeJSONFile(s.sessionPath(), sess)
+}
+
+func (s fileStore) ForgetLoginPassword() error {
+	err := os.Remove(filepath.Join(s.dir, "login-password.dpapi"))
+	if os.IsNotExist(err) {
+		return nil
+	}
+	return err
+}
+
+func (s fileStore) SaveAcceptedICloud(appleID string, accepted appleservices.RestoredICloudSession) error {
+	saved, err := s.LoadSession()
+	if err != nil || saved == nil || appleID == "" || !strings.EqualFold(saved.AppleID, appleID) ||
+		accepted.ADSID == "" || saved.DSID != accepted.ADSID || accepted.DSID == "" || accepted.MMEAuthToken == "" || accepted.ServiceData == nil {
+		return errors.New("accepted iCloud session is incomplete or belongs to another account")
+	}
+	return writeJSONFile(s.acceptedPath(), map[string]any{
+		"session": appleservices.Session{AppleID: saved.AppleID, DSID: accepted.DSID,
+			Tokens: map[string]string{"mmeAuthToken": accepted.MMEAuthToken, "cloudKitToken": accepted.CloudKitToken}},
+		"adsid": accepted.ADSID, "service-data": accepted.ServiceData,
+	})
+}
+
+// Only a missing delegate checkpoint can use the legacy migration path. A
+// malformed or mismatched checkpoint requires reconnecting, not silent reuse.
+func resumeSavedLogin(appleID string, store fileStore, options ...appleservices.Option) (*appleservices.Login, error) {
+	accepted, err := store.LoadAcceptedICloud()
+	if os.IsNotExist(err) {
+		return appleservices.ResumeVerifiedLogin(appleID, store, options...)
+	}
+	if err != nil {
+		return nil, errors.New("saved login session cannot be restored; reconnect with the current password")
+	}
+	return appleservices.ResumeLogin(appleID, store, accepted, options...)
 }
 
 func (s fileStore) LoadAcceptedICloud() (appleservices.RestoredICloudSession, error) {

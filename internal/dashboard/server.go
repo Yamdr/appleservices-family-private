@@ -22,7 +22,9 @@ import (
 	"time"
 
 	"github.com/Laky-64/appleservices/icloud"
+	"github.com/Laky-64/appleservices/internal/apppassword"
 	"github.com/Laky-64/appleservices/internal/control"
+	"github.com/Laky-64/appleservices/internal/mailsetup"
 )
 
 //go:embed web/*
@@ -44,8 +46,9 @@ type Server struct {
 	// accounts holds every registered account. The legacy single-account
 	// fields below address the account whose directory is Config.Dir, so the
 	// original one-account behaviour and its tests keep working unchanged.
-	accounts   []*Account
-	accountsMu sync.Mutex
+	accounts       []*Account
+	accountsMu     sync.Mutex
+	syncProfilesMu sync.Mutex
 	// registryNote reports why the account list could not be loaded, so a
 	// failure is surfaced instead of silently presenting an empty list.
 	registryNote string
@@ -54,6 +57,8 @@ type Server struct {
 	provisionMacPush func(context.Context, string) error
 }
 type Status struct {
+	PasswordRemembered   bool      `json:"password_remembered"`
+	LocalVerification    string    `json:"local_verification,omitempty"`
 	PID                  int       `json:"pid"`
 	Running              bool      `json:"running"`
 	PushConnected        bool      `json:"push_connected"`
@@ -73,34 +78,41 @@ type Status struct {
 	FailureStage         string    `json:"failure_stage,omitempty"`
 }
 type view struct {
-	Status               Status                  `json:"status"`
-	Devices              []control.Device        `json:"devices"`
-	Pending              *control.Pending        `json:"pending"`
-	CodeReady            bool                    `json:"code_ready"`
-	ControlReady         bool                    `json:"control_ready"`
-	Launching            bool                    `json:"launching"`
-	Message              string                  `json:"message"`
-	Account              string                  `json:"account"`
-	LoginAccount         string                  `json:"login_account,omitempty"`
-	Accounts             []AccountView           `json:"accounts,omitempty"`
-	Selected             string                  `json:"selected,omitempty"`
-	ICloudActivated      bool                    `json:"icloud_activated"`
-	Family               *control.FamilyInfo     `json:"family,omitempty"`
-	FamilyCheckedAt      string                  `json:"family_checked_at,omitempty"`
-	FamilyStale          bool                    `json:"family_stale"`
-	Storage              *icloud.StorageInfo     `json:"storage,omitempty"`
-	StorageCheckedAt     string                  `json:"storage_checked_at,omitempty"`
-	StorageStale         bool                    `json:"storage_stale"`
-	StoragePlan          *icloud.StoragePlanInfo `json:"storage_plan,omitempty"`
-	StoragePlanCheckedAt string                  `json:"storage_plan_checked_at,omitempty"`
-	StoragePlanStale     bool                    `json:"storage_plan_stale"`
-	HideMyEmailAvailable bool                    `json:"hide_my_email_available"`
-	ActivationReady      bool                    `json:"activation_ready"`
+	SecurityQuestions            *icloud.SecurityQuestionsStatus `json:"security_questions,omitempty"`
+	AppPassword                  *apppassword.Status             `json:"app_password,omitempty"`
+	PrimaryMail                  *mailsetup.State                `json:"primary_mail,omitempty"`
+	GiftCardAvailable            bool                            `json:"gift_card_available"`
+	PurchasePreparationAvailable bool                            `json:"purchase_preparation_available"`
+	StoreSessionReady            *bool                           `json:"store_session_ready,omitempty"`
+	Status                       Status                          `json:"status"`
+	Devices                      []control.Device                `json:"devices"`
+	Pending                      *control.Pending                `json:"pending"`
+	CodeReady                    bool                            `json:"code_ready"`
+	ControlReady                 bool                            `json:"control_ready"`
+	Launching                    bool                            `json:"launching"`
+	Message                      string                          `json:"message"`
+	Account                      string                          `json:"account"`
+	LoginAccount                 string                          `json:"login_account,omitempty"`
+	Accounts                     []AccountView                   `json:"accounts,omitempty"`
+	Selected                     string                          `json:"selected,omitempty"`
+	ICloudActivated              bool                            `json:"icloud_activated"`
+	Family                       *control.FamilyInfo             `json:"family,omitempty"`
+	FamilyCheckedAt              string                          `json:"family_checked_at,omitempty"`
+	FamilyStale                  bool                            `json:"family_stale"`
+	Storage                      *icloud.StorageInfo             `json:"storage,omitempty"`
+	StorageCheckedAt             string                          `json:"storage_checked_at,omitempty"`
+	StorageStale                 bool                            `json:"storage_stale"`
+	StoragePlan                  *icloud.StoragePlanInfo         `json:"storage_plan,omitempty"`
+	StoragePlanCheckedAt         string                          `json:"storage_plan_checked_at,omitempty"`
+	StoragePlanStale             bool                            `json:"storage_plan_stale"`
+	HideMyEmailAvailable         bool                            `json:"hide_my_email_available"`
+	ActivationReady              bool                            `json:"activation_ready"`
 }
 type credentials struct {
-	AppleID   string `json:"apple_id"`
-	Password  string `json:"password"`
-	TwoFactor string `json:"twofactor,omitempty"`
+	RememberPassword *bool  `json:"remember_password,omitempty"`
+	AppleID          string `json:"apple_id"`
+	Password         string `json:"password"`
+	TwoFactor        string `json:"twofactor,omitempty"`
 }
 
 func New(config Config) (*Server, error) {
@@ -219,6 +231,10 @@ func (s *Server) addAccount(ctx context.Context, creds credentials) (control.Res
 		return control.Result{Message: err.Error()}, ""
 	}
 	entry := &registryEntry{ID: id, Name: strings.SplitN(creds.AppleID, "@", 2)[0], AppleID: strings.TrimSpace(creds.AppleID), Dir: dir}
+	if err := mailsetup.Queue(dir, entry.AppleID); err != nil {
+		s.accountsMu.Unlock()
+		return control.Result{Message: "无法建立新账号的邮箱任务"}, ""
+	}
 	entries = append(entries, entry)
 	if err := saveRegistry(s.config.Dir, entries); err != nil {
 		s.accountsMu.Unlock()
@@ -438,9 +454,9 @@ func (s *Server) callFor(ctx context.Context, dir, path string, body any, result
 	request.Header.Set("Content-Type", "application/json")
 	timeout := 95 * time.Second
 	if action, ok := body.(control.Action); ok {
-		if action.Action == "storage-skill-auth-file" {
+		if action.Action == "hme-server-login-device" || action.Action == "hme-server-login" || action.Action == "hme-server-sync" || strings.HasPrefix(action.Action, "app-password-") || action.Action == "gift-prepare" || action.Action == "gift-redeem" || action.Action == "storage-skill-auth-file" || action.Action == "storage-skill-auth-local" || action.Action == "storage-purchase-prepare-us" {
 			timeout = 3*time.Minute + 5*time.Second
-		} else if action.Action == "family-add-self" || strings.HasPrefix(action.Action, "hme-") {
+		} else if action.Action == "family-add-self" || strings.HasPrefix(action.Action, "hme-") || strings.HasPrefix(action.Action, "mail-") {
 			timeout = 2*time.Minute + 5*time.Second
 		}
 	}
@@ -778,6 +794,9 @@ func (s *Server) snapshotFor(ctx context.Context, id string) view {
 	if account != nil {
 		result.Selected = account.ID
 		result.LoginAccount = account.AppleID
+		result.PrimaryMail, _ = mailsetup.Load(account.Dir, account.AppleID)
+		result.AppPassword, _ = apppassword.Load(account.Dir, account.AppleID)
+		result.SecurityQuestions = readSecurityQuestionsStatus(account)
 		result.ICloudActivated = acceptedCheckpointReady(account.Dir, account.AppleID)
 		result.ActivationReady = !result.ICloudActivated && verifiedGSACheckpointReady(account.Dir, account.AppleID)
 		if family, checkedAt, stale := readFamilyCache(account); family != nil {
@@ -811,6 +830,11 @@ func (s *Server) snapshotFor(ctx context.Context, id string) view {
 			result.Devices = live.Devices
 			result.Pending = live.Pending
 			result.CodeReady = live.CodeReady
+			if slices.Contains(live.Capabilities, "store-session-status") {
+				result.StoreSessionReady = &live.StoreSessionReady
+			}
+			result.PurchasePreparationAvailable = slices.Contains(live.Capabilities, "storage-purchase-prepare")
+			result.GiftCardAvailable = slices.Contains(live.Capabilities, "gift-card")
 			result.HideMyEmailAvailable = slices.Contains(live.Capabilities, "hide-my-email")
 			result.ControlReady = true
 		}
@@ -818,13 +842,13 @@ func (s *Server) snapshotFor(ctx context.Context, id string) view {
 	return result
 }
 func (s *Server) Start(ctx context.Context, creds credentials) control.Result {
-	// Start acts on the account that owns the server's own directory. A
-	// registered account is started through startAccount so one account's
-	// credentials can never land in another account's directory.
+	// Existing accounts retain their identity. A fresh installation must create
+	// its first account and device binding before attempting Mac APS setup.
 	if account := s.lookup(""); account != nil {
 		return s.startAccount(ctx, account, creds)
 	}
-	return s.startIn(ctx, s.config.Dir, creds, nil)
+	result, _ := s.addAccount(ctx, creds)
+	return result
 }
 
 // startAccount starts one registered account inside its own directory.
@@ -846,7 +870,7 @@ func (s *Server) startIn(ctx context.Context, dir string, creds credentials, acc
 }
 
 func (s *Server) startSavedAccount(ctx context.Context, account *Account) control.Result {
-	if account == nil || !verifiedGSACheckpointReady(account.Dir, account.AppleID) || !acceptedCheckpointReady(account.Dir, account.AppleID) {
+	if account == nil || !savedLoginReady(account.Dir, account.AppleID) {
 		return control.Result{Message: "已保存登录会话不可用，请输入当前密码重新连接"}
 	}
 	return s.startInMode(ctx, account.Dir, credentials{AppleID: account.AppleID}, account, true)
@@ -912,6 +936,13 @@ func (s *Server) startInMode(ctx context.Context, dir string, creds credentials,
 	defer diagnostic.Close()
 	command := exec.Command(s.config.Worker, "-native-adi", "-background", "-control-api", "-gui-auth", "-dir", dir, "-adi-dll", s.config.Library, "-python", s.config.Python)
 	command.Args = append(command.Args, "-twofactor", creds.TwoFactor)
+	if creds.RememberPassword != nil {
+		if *creds.RememberPassword {
+			command.Args = append(command.Args, "-remember-password")
+		} else {
+			command.Args = append(command.Args, "-forget-password")
+		}
+	}
 	if resume {
 		command.Args = append(command.Args, "-resume-session")
 	}
@@ -962,7 +993,7 @@ func lastProcessError(path string) string {
 			return "所选目录缺少有效设备身份，请选择已有账号，或通过添加账号建立身份"
 		case strings.Contains(line, "APPLESERVICES_APPLEID and APPLESERVICES_PASSWORD are required"):
 			return "请重新输入当前账号密码"
-		case strings.Contains(line, "saved login session cannot be restored"):
+		case strings.Contains(line, "saved login session cannot be restored"), strings.Contains(line, "saved device session was not accepted"), strings.Contains(line, "saved iCloud session was not accepted"), strings.Contains(line, "saved login session is incomplete"):
 			return "Apple 已保存会话失效，请输入当前账号密码重新连接"
 		case strings.Contains(line, "ec=-22406") && strings.Contains(line, "correct password"):
 			return "Apple 拒绝了当前密码，请确认使用的是这个账号的最新密码，并关闭密码管理器的旧自动填充"
@@ -1024,7 +1055,7 @@ func (s *Server) Bootstrap(ctx context.Context, appleID, password string) {
 		accounts := append([]*Account(nil), s.accounts...)
 		s.accountsMu.Unlock()
 		for _, account := range accounts {
-			if ctx.Err() != nil || s.accountStatus(account).Running || !acceptedCheckpointReady(account.Dir, account.AppleID) || !verifiedGSACheckpointReady(account.Dir, account.AppleID) {
+			if ctx.Err() != nil || s.accountStatus(account).Running || !savedLoginReady(account.Dir, account.AppleID) {
 				continue
 			}
 			result := s.startSavedAccount(ctx, account)
@@ -1101,6 +1132,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			defer cancel()
 			json.NewEncoder(w).Encode(s.snapshotFor(ctx, r.URL.Query().Get("account")))
 			return
+		case r.URL.Path == "/api/sync-profiles" && (r.Method == "GET" || r.Method == "POST"):
+			s.serveSyncProfiles(w, r)
+			return
 		case r.Method == "POST" && r.URL.Path == "/api/start":
 			var creds credentials
 			if !readJSON(w, r, &creds) {
@@ -1121,6 +1155,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			result, id := s.addAccount(r.Context(), creds)
 			if id != "" {
+				result.AccountID = id
 				result.Message = strings.TrimSpace(result.Message)
 			}
 			json.NewEncoder(w).Encode(result)
@@ -1166,9 +1201,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			json.NewEncoder(w).Encode(result)
 			return
 		case r.Method == "POST" && r.URL.Path == "/api/action":
-			var action control.Action
-			if !readJSON(w, r, &action) {
+			var input struct {
+				control.Action
+				ProfileID string `json:"profile_id,omitempty"`
+			}
+			if !readJSON(w, r, &input) {
 				return
+			}
+			action := input.Action
+			if (action.Action == "hme-server-sync" || action.Action == "hme-server-login" || action.Action == "hme-server-login-device") && input.ProfileID != "" {
+				profile, err := s.resolveSyncProfile(input.ProfileID, action.Note)
+				if err != nil {
+					json.NewEncoder(w).Encode(control.Result{Message: err.Error()})
+					return
+				}
+				action.Note, action.Code = profile.URL, profile.Token
 			}
 			dir := s.config.Dir
 			var selected *Account

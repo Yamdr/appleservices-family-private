@@ -24,6 +24,8 @@ import (
 	"github.com/Laky-64/appleservices/icloud"
 	"github.com/Laky-64/appleservices/internal/circle"
 	"github.com/Laky-64/appleservices/internal/control"
+	"github.com/Laky-64/appleservices/internal/hmesync"
+	"github.com/Laky-64/appleservices/internal/mailsetup"
 	"github.com/Laky-64/appleservices/nativeadi"
 )
 
@@ -63,6 +65,8 @@ func run() (runErr error) {
 	controlAPI := flag.Bool("control-api", false, "enable authenticated local dashboard control")
 	guiAuth := flag.Bool("gui-auth", false, "complete initial SMS verification through the dashboard")
 	resumeSession := flag.Bool("resume-session", false, "restore the account-bound GSA and accepted iCloud sessions without a password")
+	rememberPassword := flag.Bool("remember-password", false, "save a verified password with Windows user encryption for automatic reconnect")
+	forgetPassword := flag.Bool("forget-password", false, "remove the saved password after this successful login")
 	flag.Parse()
 	if *background {
 		*controlAPI = true
@@ -165,7 +169,13 @@ func run() (runErr error) {
 	}
 	os.Unsetenv("APPLESERVICES_APPLEID")
 	os.Unsetenv("APPLESERVICES_PASSWORD")
-	status := runtimeStatus{PID: os.Getpid(), Running: true, State: "starting"}
+	storedPassword := savedLoginPassword(store, appleID)
+	if *resumeSession && password == "" {
+		password = storedPassword
+	}
+	passwordRemembered := storedPassword != ""
+	storedPassword = ""
+	status := initialRuntimeStatus(os.Getpid(), passwordRemembered)
 	if err := status.save(*dir); err != nil {
 		return err
 	}
@@ -286,12 +296,22 @@ func run() (runErr error) {
 		return err
 	}
 	var login *appleservices.Login
+	var reconnect reconnectGate
 	if *resumeSession {
-		accepted, loadErr := store.LoadAcceptedICloud()
-		if loadErr != nil {
-			return errors.New("saved login session cannot be restored; reconnect with the current password")
+		login, err = resumeSavedLogin(appleID, store, options...)
+		if err == nil {
+			_, err = login.Client()
+			if err == nil {
+				_, err = login.AccountDevices()
+			}
+			if err == nil {
+				_, err = login.StorageInfo(ctx)
+			}
 		}
-		login, err = appleservices.ResumeLogin(appleID, store, accepted, options...)
+		if reconnect.allow(err, password) {
+			login, err = appleservices.BeginLogin(appleservices.Credentials{AppleID: appleID, Password: password}, store, options...)
+			*resumeSession = false
+		}
 	} else {
 		login, err = appleservices.BeginLogin(appleservices.Credentials{AppleID: appleID, Password: password}, store, options...)
 	}
@@ -302,6 +322,20 @@ func run() (runErr error) {
 		return err
 	}
 	input := bufio.NewReader(os.Stdin)
+	localVerificationTried := false
+	verifyLocal := func(candidate *appleservices.Login) {
+		attempted, state, verificationErr := completeLocalVerification(*method, localADI != nil && !*listenOnly, candidate, func() (string, error) {
+			codeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			return generateCode(codeCtx)
+		})
+		localVerificationTried = attempted
+		status.LocalVerification = state
+		if verificationErr != nil {
+			fmt.Fprintln(os.Stderr, "Local device verification requires manual completion; no automatic retry.")
+		}
+	}
+	verifyLocal(login)
 	if login.NeedsTwoFactor() && *method == "circle" {
 		if panel == nil || !*guiAuth {
 			return errors.New("Circle login requires the dashboard control API")
@@ -316,11 +350,8 @@ func run() (runErr error) {
 			status.State = "verification_required"
 			return errVerificationRequired
 		}
-		factor := appleservices.SMS
-		if *method == "trusted-device" {
-			factor = appleservices.TrustedDevice
-		}
-		if *method != "sms-existing" {
+		factor := initialVerificationFactor(*method)
+		if *method != "sms-existing" && !localVerificationTried {
 			if err := login.RequestCode(factor); err != nil {
 				return err
 			}
@@ -346,32 +377,8 @@ func run() (runErr error) {
 					if command.Context.Err() != nil {
 						continue
 					}
-					result := control.Result{}
-					switch command.Action.Action {
-					case "resend-sms":
-						if time.Since(lastSent) < time.Minute {
-							result.Message = "请间隔一分钟再重发短信"
-						} else if login.RequestCode(factor) != nil {
-							result.Message = "短信发送失败，请稍后重试"
-						} else {
-							lastSent = time.Now()
-							result.OK = true
-							result.Message = "短信已发送"
-						}
-					case "submit-sms":
-						// The reason Apple gives is the only thing that
-						// separates an expired code from a rejected one, so it
-						// is reported instead of a fixed message.
-						if err := login.SubmitCode(factor, command.Code); err != nil {
-							result.Message = "验证码未被接受：" + err.Error()
-						} else {
-							result.OK = true
-							result.Message = "验证码已验证，正在完成登录"
-							verified = true
-						}
-					default:
-						result.Message = "请先完成短信验证"
-					}
+					result, completed := pendingVerificationAction(login, factor, command.Action.Action, command.Code, &lastSent, time.Now())
+					verified = completed
 					command.Reply <- result
 				}
 				if stopRequested(*dir, status.PID) {
@@ -428,6 +435,16 @@ func run() (runErr error) {
 	if ctx.Err() != nil {
 		return nil
 	}
+	// Restored local tokens are not proof of a live login. Require Apple to
+	// accept both device-management and iCloud access before showing online.
+	if *resumeSession {
+		if err != nil {
+			return errors.New("saved device session was not accepted; reconnect with the current password")
+		}
+		if _, quotaErr := login.StorageInfo(ctx); quotaErr != nil {
+			return errors.New("saved iCloud session was not accepted; reconnect with the current password")
+		}
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Could not verify account device status:", err)
 	} else {
@@ -447,6 +464,35 @@ func run() (runErr error) {
 	if err := active.SaveSession(); err != nil {
 		return err
 	}
+	if *forgetPassword {
+		if err := store.ForgetLoginPassword(); err != nil {
+			return errors.New("could not remove protected login credential")
+		}
+		passwordRemembered = false
+	} else if *rememberPassword || passwordRemembered {
+		protected, ok := any(store).(loginPasswordStore)
+		if !ok || protected.SaveLoginPassword(appleID, password) != nil {
+			return errors.New("could not save Windows protected login credential")
+		}
+		passwordRemembered = true
+	}
+	status.PasswordRemembered = passwordRemembered
+	reconnect.blocked = false
+	if *resumeSession {
+		var storeErr error
+		if passwordRemembered {
+			_, storeErr = login.CheckSkillStoragePurchaseSession(ctx, func() (string, error) {
+				codeCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+				defer cancel()
+				return generateCode(codeCtx)
+			})
+		} else {
+			_, storeErr = login.RestoreStorePurchaseSession(ctx)
+		}
+		if storeErr != nil {
+			fmt.Fprintln(os.Stderr, "Saved Store session needs a new check or reconnect; iCloud login is still available.")
+		}
+	}
 	status.Authenticated, status.State = true, "online"
 	if err != nil {
 		status.State = "device_query_failed"
@@ -454,6 +500,7 @@ func run() (runErr error) {
 	status.LastRefreshAt = time.Now().UTC()
 	if panel != nil {
 		panel.SetReady(!*listenOnly)
+		panel.SetStoreSessionReady(login.StorePurchaseSessionReady())
 	}
 	if err := status.save(*dir); err != nil {
 		return err
@@ -520,26 +567,50 @@ func run() (runErr error) {
 	refresh := time.NewTicker(*refreshEvery)
 	defer refresh.Stop()
 	beginRenewal := func() (maintainedLogin, error) {
-		if *resumeSession {
-			accepted, err := store.LoadAcceptedICloud()
-			if err != nil {
-				return nil, err
+		if *resumeSession || passwordRemembered {
+			saved, err := resumeSavedLogin(appleID, store, options...)
+			if err == nil {
+				_, err = saved.StorageInfo(ctx)
 			}
-			return appleservices.ResumeLogin(appleID, store, accepted, options...)
+			return saved, err
 		}
-		return appleservices.BeginLogin(appleservices.Credentials{AppleID: appleID, Password: password}, store, options...)
+		renewed, err := appleservices.BeginLogin(appleservices.Credentials{AppleID: appleID, Password: password}, store, options...)
+		if err == nil {
+			verifyLocal(renewed)
+		}
+		return renewed, err
 	}
 	renew := func() control.Result {
-		renewed, devices, err := renewSessionMode(beginRenewal, accountID, registration, !*resumeSession)
+		if status.VerificationRequired {
+			return control.Result{Stage: "verification-required", Message: "需要完成账号验证或重新连接，后台不会自动重复申请验证码"}
+		}
+		status.LocalVerification = localVerificationNotAttempted
+		renewed, devices, err := renewWithReconnect(beginRenewal, func() (maintainedLogin, error) {
+			candidate, loginErr := appleservices.BeginLogin(appleservices.Credentials{AppleID: appleID, Password: password}, store, options...)
+			if loginErr == nil {
+				verifyLocal(candidate)
+			}
+			return candidate, loginErr
+		}, accountID, registration, !*resumeSession && !passwordRemembered, password, &reconnect)
 		if err != nil {
 			status.State = "refresh_failed"
-			if errors.Is(err, errVerificationRequired) {
+			if errors.Is(err, errVerificationRequired) || reconnect.blocked {
 				status.State, status.VerificationRequired = "verification_required", true
 			}
 			status.save(*dir)
 			return control.Result{Message: "续登录失败，请检查登录状态"}
 		}
+		if previousLogin, ok := active.(*appleservices.Login); ok {
+			if renewedLogin, ok := renewed.(*appleservices.Login); ok {
+				renewedLogin.InheritStorePurchaseSession(previousLogin)
+			}
+		}
 		active = renewed
+		reconnect.blocked = false
+		if panel != nil {
+			ready, ok := active.(interface{ StorePurchaseSessionReady() bool })
+			panel.SetStoreSessionReady(ok && ready.StorePurchaseSessionReady())
+		}
 		status.State, status.Authenticated = "online", true
 		status.LastRefreshAt = time.Now().UTC()
 		status.RefreshCount++
@@ -553,11 +624,12 @@ func run() (runErr error) {
 		return control.Result{OK: true, Message: "登录已续期，设备列表已更新"}
 	}
 	var hmeClient *icloud.HideMyEmailClient
+	securityAnswers := accountSecurityAnswers{store: store, appleID: appleID}
 	var accountManagementClient *icloud.AppleAccountClient
 	pendingHMECandidate := ""
 	pendingReachableEmail := ""
 	loadHME := func(actionCtx context.Context) (*icloud.HideMyEmailInfo, error) {
-		if err := requireHMEFamilyMember(*dir, time.Now().UTC()); err != nil {
+		if err := requireHMEAccess(actionCtx, *dir, active); err != nil {
 			return nil, err
 		}
 		if hmeClient == nil {
@@ -566,6 +638,7 @@ func run() (runErr error) {
 			if clientErr != nil {
 				return nil, clientErr
 			}
+			hmeClient.SetSecurityQuestionsProvider(securityAnswers)
 		}
 		info, err := hmeClient.List(actionCtx)
 		if !errors.Is(err, icloud.ErrHMEAuthenticationRequired) {
@@ -576,11 +649,126 @@ func run() (runErr error) {
 		}
 		return hmeClient.List(actionCtx)
 	}
-	performAction := func(actionCtx context.Context, action, visibleRequestID, commandCode, commandLabel, commandNote string) control.Result {
+	autoHMEForward := make(chan struct{}, 1)
+	autoAppPassword := make(chan struct{}, 1)
+	performAction := func(actionCtx context.Context, action, visibleRequestID, commandCode, commandLabel, commandNote string, answers []icloud.SecurityQuestionAnswer) control.Result {
+		if action == "hme-server-login" || action == "hme-server-login-device" {
+			queryCtx, done := context.WithTimeout(actionCtx, 170*time.Second)
+			defer done()
+			var result *hmesync.LoginResult
+			var err error
+			if action == "hme-server-login-device" {
+				result, err = hmesync.VerifyDeviceCode(queryCtx, commandNote, commandCode, appleID, commandLabel, visibleRequestID)
+			} else {
+				result, err = hmesync.Login(queryCtx, commandNote, commandCode, appleID, password, commandLabel, visibleRequestID, generateCode)
+			}
+			if err != nil {
+				return control.Result{Message: err.Error(), Stage: "hme-server-login"}
+			}
+			if result.State == "otp_required" {
+				message := "Apple 要求补充验证码，请输入受信任设备上显示的六位验证码"
+				if result.DeviceCodeSupported {
+					message = "请选择验证码来源并输入六位验证码"
+				} else if result.Verification == "sms" {
+					message = "当前服务器只支持短信验证；使用 iPhone 或 Mac 验证码需更新服务器"
+				}
+				return control.Result{Message: message, Stage: "hme-server-login", ServerLogin: result}
+			}
+			return control.Result{OK: true, Message: "Web、IMAP 和 Apple 新通道均已就绪", Stage: "hme-server-login", ServerLogin: result}
+		}
+		if action == "hme-server-sync" {
+			if _, err := hmesync.Endpoint(commandNote); err != nil {
+				return control.Result{Message: err.Error(), Stage: "hme-server-sync"}
+			}
+			queryCtx, done := context.WithTimeout(actionCtx, 170*time.Second)
+			defer done()
+			info, err := loadHME(queryCtx)
+			if err != nil {
+				return control.Result{Message: "隐藏邮箱会话未通过核验，请先读取隐藏邮箱", Stage: "hme-server-sync"}
+			}
+			mailbox := ownICloudForwardTarget(info)
+			if mailbox == "" {
+				return control.Result{Message: "无法唯一确定本账号的 iCloud 邮箱，请先设置隐私邮箱转发", Stage: "hme-server-sync"}
+			}
+			if !hmeForwardMatches(info, mailbox) {
+				return control.Result{Message: "请先将隐私邮箱转发到本账号的 iCloud 邮箱", Stage: "hme-server-sync"}
+			}
+			record, err := store.LoadAppPassword(appleID)
+			if err != nil || record == nil {
+				return control.Result{Message: "请先配置并加密保存本账号的应用专用密码", Stage: "hme-server-sync"}
+			}
+			cookies, host, err := hmeClient.ExportServerCookies()
+			if err != nil {
+				return control.Result{Message: err.Error(), Stage: "hme-server-sync"}
+			}
+			name := strings.TrimSpace(commandLabel)
+			if name == "" {
+				name = appleID
+			}
+			if len(name) > 64 {
+				name = mailbox
+			}
+			id, err := hmesync.Import(queryCtx, commandNote, commandCode, hmesync.Payload{Version: 1, SourceID: hmesync.SourceID(appleID), AppleID: appleID, Name: name, ICloudEmail: mailbox, Host: host, Cookies: cookies, AppPassword: record.Password})
+			if err != nil {
+				return control.Result{Message: err.Error(), Stage: "hme-server-sync"}
+			}
+			return control.Result{OK: true, Message: "服务器已导入账号，隐藏邮箱和 IMAP 均已验证 · " + id, Stage: "hme-server-sync"}
+		}
+		if action == "app-password-ensure" || action == "app-password-save" {
+			manual := ""
+			if action == "app-password-save" {
+				manual = strings.TrimSpace(commandCode)
+				if manual == "" {
+					return control.Result{Message: "请输入应用专用密码", Stage: "app-password-format"}
+				}
+			}
+			return appPasswordAction(actionCtx, *dir, appleID, password, manual, store, func(checkCtx context.Context) (bool, error) {
+				source, ok := active.(interface {
+					StorageInfo(context.Context) (*icloud.StorageInfo, error)
+				})
+				if !ok {
+					return false, errors.New("storage query unavailable")
+				}
+				quota, err := source.StorageInfo(checkCtx)
+				return quota != nil && quota.PaidBytes > 0, err
+			}, func() (appPasswordPortal, error) {
+				portal, err := icloud.NewAppleAccountClientWithStore(*dir, appleID)
+				if err == nil {
+					portal.SetSecurityQuestionsProvider(securityAnswers)
+				}
+				return portal, err
+			}, generateCode)
+		}
+		if action == "security-resume" {
+			if err := securityAnswers.resume(); err != nil {
+				return control.Result{Message: err.Error(), Stage: "security-questions"}
+			}
+			return control.Result{OK: true, Message: "已允许再次检查安全验证", Stage: "security-questions"}
+		}
+		if action == "security-save" || action == "security-clear" {
+			if err := securityAnswers.update(answers, action == "security-clear"); err != nil {
+				return control.Result{Message: err.Error(), Stage: "security-questions"}
+			}
+			return control.Result{OK: true, Message: "安全问题答案已使用 Windows 本机加密更新", Stage: "security-questions"}
+		}
+		if action == "mail-check" || action == "mail-ensure" {
+			mailClient, mailErr := icloud.NewPrimaryMailClient(*dir, appleID)
+			if mailErr != nil {
+				return control.Result{Message: "无法初始化 iCloud 邮箱客户端", Stage: "primary-mail"}
+			}
+			mailClient.SetSecurityQuestionsProvider(securityAnswers)
+			return primaryMailAction(actionCtx, *dir, appleID, password, generateCode, action == "mail-check", mailClient)
+		}
+		defer func() {
+			if panel != nil {
+				ready, ok := active.(interface{ StorePurchaseSessionReady() bool })
+				panel.SetStoreSessionReady(ok && ready.StorePurchaseSessionReady())
+			}
+		}()
 		if action == "hme-accept-terms" {
 			queryCtx, done := context.WithTimeout(actionCtx, 115*time.Second)
 			defer done()
-			if err := requireHMEFamilyMember(*dir, time.Now().UTC()); err != nil {
+			if err := requireHMEAccess(actionCtx, *dir, active); err != nil {
 				return control.Result{Message: "当前账号不满足隐藏邮件地址家庭条件：" + err.Error(), Stage: "hme-family"}
 			}
 			var clientErr error
@@ -588,6 +776,7 @@ func run() (runErr error) {
 			if clientErr != nil {
 				return control.Result{Message: "无法初始化隐藏邮件地址客户端", Stage: "hme-session"}
 			}
+			hmeClient.SetSecurityQuestionsProvider(securityAnswers)
 			err := hmeClient.AcceptPendingTerms(queryCtx)
 			if errors.Is(err, icloud.ErrHMEWebRepairSessionUnavailable) {
 				err = hmeClient.AuthenticateAndAcceptTerms(queryCtx, password, generateCode)
@@ -620,8 +809,8 @@ func run() (runErr error) {
 				return control.Result{Message: "标签、备忘录或邮箱地址过长", Stage: "hme-validation"}
 			}
 			switch action {
-			case "hme-list":
-				return control.Result{OK: true, Message: "已读取当前子号的隐藏邮件地址", Stage: "hme-list", HideMyEmail: info}
+			case "hme-list", "hme-auto-forward":
+				return automaticHMEForwardResult(queryCtx, *dir, appleID, hmeClient, info, "已读取隐藏邮件地址", "hme-list")
 			case "hme-generate":
 				candidate, generateErr := hmeClient.Generate(queryCtx, "zh-cn")
 				if generateErr != nil {
@@ -642,7 +831,7 @@ func run() (runErr error) {
 					stopReadback()
 					if readbackErr == nil && reservedAliasPresent(readback, pendingHMECandidate, label, note) {
 						pendingHMECandidate = ""
-						return control.Result{OK: true, Message: "隐藏邮件地址已创建；Apple 创建响应异常，但已通过实时列表回读确认", Stage: "hme-reserve-reconciled", HideMyEmail: readback}
+						return automaticHMEForwardResult(queryCtx, *dir, appleID, hmeClient, readback, "隐藏邮件地址已创建并通过实时列表回读", "hme-reserve-reconciled")
 					}
 					return control.Result{Message: "候选地址未确认创建；请刷新列表后核对，不要重复提交", Stage: "hme-reserve"}
 				}
@@ -658,6 +847,9 @@ func run() (runErr error) {
 				if readbackErr != nil || readback == nil || !strings.EqualFold(strings.TrimSpace(readback.SelectedForward), alias) {
 					return control.Result{Message: "Apple 已接收更新，但默认转发邮箱尚未通过回读确认；请勿重复提交", Stage: "hme-forward-readback"}
 				}
+				if err := writeJSONFile(filepath.Join(*dir, "hme-forward.json"), hmeForwardState{AppleID: appleID, Target: alias, Done: true}); err != nil {
+					return control.Result{OK: true, Message: "转发已更新，但手动设置未能保存到本机，请重新核对", Stage: "hme-forward-pending", HideMyEmail: readback}
+				}
 				return control.Result{OK: true, Message: "默认转发邮箱已更新，并通过 Apple 实时列表回读", Stage: "hme-forward-completed", HideMyEmail: readback}
 			case "hme-reachable-start":
 				if alias == "" || !strings.Contains(alias, "@") {
@@ -668,6 +860,7 @@ func run() (runErr error) {
 				if clientErr != nil {
 					return control.Result{Message: "无法初始化 Apple 账户管理会话", Stage: "hme-reachable-session"}
 				}
+				accountManagementClient.SetSecurityQuestionsProvider(securityAnswers)
 				if clientErr = accountManagementClient.Resume(queryCtx); clientErr != nil {
 					if password == "" {
 						accountManagementClient = nil
@@ -755,6 +948,9 @@ func run() (runErr error) {
 				return control.Result{Message: "操作已提交，但列表回读未完成；请勿重复操作", Stage: "hme-readback"}
 			}
 			messages := map[string]string{"hme-reserve": "隐藏邮件地址已创建并通过列表回读", "hme-update": "标签和备忘录已更新", "hme-deactivate": "隐藏邮件地址已停用", "hme-reactivate": "隐藏邮件地址已恢复", "hme-delete": "隐藏邮件地址已永久删除"}
+			if action == "hme-reserve" {
+				return automaticHMEForwardResult(queryCtx, *dir, appleID, hmeClient, info, messages[action], action+"-completed")
+			}
 			return control.Result{OK: true, Message: messages[action], Stage: action + "-completed", HideMyEmail: info}
 		}
 		if action == "storage-preview" {
@@ -803,14 +999,14 @@ func run() (runErr error) {
 		}
 		if action == "storage-skill-auth-local" {
 			checker, ok := active.(interface {
-				CheckSkillStoragePurchaseSession(context.Context, func() (string, error)) (*icloud.StoreAuthenticationInfo, error)
+				RefreshSkillStoragePurchaseSession(context.Context, func() (string, error)) (*icloud.StoreAuthenticationInfo, error)
 			})
 			if !ok {
 				return control.Result{Message: "后台版本不支持匹配 Store bag 的认证", Stage: "worker"}
 			}
 			queryCtx, done := context.WithTimeout(actionCtx, 3*time.Minute)
 			defer done()
-			info, err := checker.CheckSkillStoragePurchaseSession(queryCtx, func() (string, error) {
+			info, err := checker.RefreshSkillStoragePurchaseSession(queryCtx, func() (string, error) {
 				return generateCode(queryCtx)
 			})
 			if err != nil {
@@ -821,7 +1017,7 @@ func run() (runErr error) {
 				}
 				return result
 			}
-			return control.Result{OK: true, Message: "匹配 Store bag 的认证已通过；未提交购买", StoreAuthentication: info}
+			return control.Result{OK: true, Message: "购买会话已重新认证；未提交购买", StoreAuthentication: info}
 		}
 		if action == "storage-skill-auth-file" {
 			checker, ok := active.(interface {
@@ -845,6 +1041,70 @@ func run() (runErr error) {
 			}
 			return control.Result{OK: true, Message: "实时验证码已在同一 Store 会话中通过；未提交购买", StoreAuthentication: info}
 		}
+
+		if action == "gift-prepare" || action == "gift-redeem" {
+			redeemer, ok := active.(giftCardRedeemer)
+			if !ok {
+				return control.Result{Message: "请重新连接账号加载兑换协议", Stage: "worker-upgrade-required"}
+			}
+			queryCtx, done := context.WithTimeout(actionCtx, 170*time.Second)
+			defer done()
+			var info *icloud.GiftCardInfo
+			var err error
+			if action == "gift-prepare" {
+				info, err = redeemer.PrepareGiftCard(queryCtx, func() (string, error) { return generateCode(queryCtx) })
+			} else {
+				info, err = redeemPreparedGiftCard(queryCtx, redeemer, visibleRequestID, commandCode, func() (string, error) { return generateCode(queryCtx) })
+			}
+			result := control.Result{GiftCard: info, Stage: "gift-result", Message: "兑换未确认，请核对官方账户余额；不会自动重试"}
+			if info != nil && info.State == "not-submitted" {
+				result.Message = "兑换检查未通过，尚未提交兑换"
+			}
+			if err != nil {
+				var failure *icloud.StorageError
+				if errors.As(err, &failure) {
+					result.Stage = failure.Stage
+					result.HTTPStatus = failure.HTTPStatus
+				}
+				return result
+			}
+			if info != nil {
+				result.AppleCode = info.AppleCode
+				switch info.State {
+				case "prepared":
+					result.OK = true
+					result.Message = "兑换会话和账号已核验；尚未提交兑换"
+				case "completed":
+					result.OK = true
+					result.Message = "Apple 已确认礼品卡入账，已返回入账金额与余额"
+				case "rejected":
+					result.Message = "Apple 未接受此次兑换，请核对兑换码及官方余额；不会自动重试"
+				case "confirmation-required":
+					result.Message = "Apple 要求额外处理，请使用官方客户端核对；程序不会继续确认或开通其他订阅"
+				}
+			}
+			return result
+		}
+		if action == "storage-purchase-prepare-us" {
+			preparer, ok := active.(interface {
+				PrepareSkillStoragePurchase(context.Context, appleservices.PurchaseTarget, func() (string, error)) (*appleservices.StoragePurchasePreparation, error)
+			})
+			if !ok {
+				return control.Result{Message: "请重新连接账号，加载支持购买预检查的后台", Stage: "worker-upgrade-required"}
+			}
+			queryCtx, done := context.WithTimeout(actionCtx, 3*time.Minute)
+			defer done()
+			target := appleservices.PurchaseTarget{Bytes: 50 * 1024 * 1024 * 1024, PriceMinor: 99, Currency: "USD", Period: "month"}
+			prepared, err := preparer.PrepareSkillStoragePurchase(queryCtx, target, func() (string, error) { return generateCode(queryCtx) })
+			if err != nil {
+				result := skillStoragePurchaseResult(nil, err)
+				if result.Stage == "purchase-verification" {
+					result.Message = "购买预检查未完成；未提交购买"
+				}
+				return result
+			}
+			return control.Result{OK: true, Stage: "purchase-prepared", Message: "购买会话、实时报价及现有订阅已检查；等待你确认，未提交购买", Storage: prepared.Storage, StoragePlan: prepared.Plans, StoreAuthentication: &icloud.StoreAuthenticationInfo{Ready: true}}
+		}
 		if action == "storage-skill-purchase-us" {
 			buyer, ok := active.(interface {
 				SubmitSkillStoragePurchase(context.Context, appleservices.PurchaseTarget, string) (*appleservices.PurchaseResult, error)
@@ -856,15 +1116,9 @@ func run() (runErr error) {
 			defer done()
 			target := appleservices.PurchaseTarget{Bytes: 50 * 1024 * 1024 * 1024, PriceMinor: 99, Currency: "USD", Period: "month"}
 			purchase, err := buyer.SubmitSkillStoragePurchase(queryCtx, target, "290571")
-			if err != nil {
-				result := control.Result{Message: "美区购买或核验未完成；不得自动重试", Stage: "purchase"}
-				var failure *icloud.StorageError
-				if errors.As(err, &failure) {
-					result.Stage, result.HTTPStatus, result.AppleCode, result.AppleHint = failure.Stage, failure.HTTPStatus, failure.AppleCode, failure.Hint
-				}
-				return result
-			}
-			return control.Result{OK: true, Purchase: purchase, Message: "美区 50GB 订阅和付费配额均已核验", Stage: "purchase-completed"}
+			result := skillStoragePurchaseResult(purchase, err)
+			queueHMEForwardAfterPurchase(result, autoHMEForward)
+			return result
 		}
 		if action == "family-info" || action == "family-add-self" || action == "family-join-storage" {
 			executable, execErr := os.Executable()
@@ -1111,6 +1365,16 @@ func run() (runErr error) {
 			return renew()
 		}
 		if action == "validate-account" {
+			if *resumeSession {
+				// Validate the restored session with Apple instead of starting
+				// a password challenge that this worker cannot complete.
+				result := renew()
+				if result.OK {
+					result.Message = "Apple 已核验保存的登录会话，无需重新输入密码"
+				}
+				return result
+			}
+			status.LocalVerification = localVerificationNotAttempted
 			if err := active.BeginAccountValidation(); err != nil {
 				status.State, status.VerificationRequired = "refresh_failed", true
 				_ = status.save(*dir)
@@ -1244,8 +1508,32 @@ func run() (runErr error) {
 		}
 		return control.Result{OK: true, Code: code, HideAt: time.Now().Add(time.Minute).UTC(), Message: "操作已完成"}
 	}
+	// Only newly added accounts have a queued intent. Existing accounts are
+	// never provisioned as a side effect of upgrading/restarting the worker.
+	var autoMail <-chan time.Time
+	if task, loadErr := mailsetup.Load(*dir, appleID); loadErr == nil && task.AutoCreate && task.Phase != "ready" && !*listenOnly {
+		timer := time.NewTimer(time.Second)
+		defer timer.Stop()
+		autoMail = timer.C
+	}
+	// Reuse encrypted records; otherwise provision once after a paid-account
+	// login. The task's durable marker prevents replay after ambiguous creation.
+	if !*listenOnly {
+		autoAppPassword <- struct{}{}
+	}
 	for {
 		select {
+		case <-autoAppPassword:
+			performAction(ctx, "app-password-ensure", "", "", "", "", nil)
+		case <-autoHMEForward:
+			// Run after replying to the verified purchase, so web authentication
+			// cannot turn a completed subscription into an HTTP timeout.
+			performAction(ctx, "hme-auto-forward", "", "", "", "", nil)
+		case <-autoMail:
+			autoMail = nil // once per successful connection; no polling/retry loop
+			if task, err := mailsetup.Load(*dir, appleID); err == nil && task.Phase != "ready" {
+				performAction(ctx, "mail-ensure", "", "", "", "", nil)
+			}
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.Canceled) || (*listenFor > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded)) {
 				return nil
@@ -1317,7 +1605,9 @@ func run() (runErr error) {
 				command.Reply <- control.Result{Message: "请重新查看当前登录请求"}
 				continue
 			}
-			command.Reply <- performAction(command.Context, command.Action.Action, command.RequestID, command.Code, command.Label, command.Note)
+			result := performAction(command.Context, command.Action.Action, command.RequestID, command.Code, command.Label, command.Note, command.SecurityAnswers)
+			queueHMEForwardAfterPurchase(result, autoAppPassword)
+			command.Reply <- result
 		case <-refresh.C:
 			result := renew()
 			if status.VerificationRequired {
@@ -1417,7 +1707,7 @@ func run() (runErr error) {
 			if choice != "devices" && choice != "refresh" && choice != "code" && choice != "allow" && choice != "deny" {
 				continue
 			}
-			result := performAction(ctx, choice, "", "", "", "")
+			result := performAction(ctx, choice, "", "", "", "", nil)
 			if result.Code != "" {
 				fmt.Println("Apple verification code:", result.Code)
 			} else {

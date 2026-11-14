@@ -1,5 +1,11 @@
 # appleservices — iCloud 登录与 Windows 验证码
 
+> [!WARNING]
+> 本项目是非官方、仅限非商业用途的源码公开项目，与 Apple Inc. 无关联或授权关系。
+> 使用者必须仅操作自己拥有或获明确授权的账号与设备，并自行承担账号风控、锁定、
+> 会话失效、数据丢失、订阅或费用变化等风险。严禁商用；下载、运行或分发即表示接受
+> [许可证](LICENSE)和[免责声明](DISCLAIMER.md)。权利投诉见[下架政策](TAKEDOWN.md)。
+
 这个版本提供设备身份认证、Apple ID 登录、双重验证和 iCloud 登录令牌获取。
 普通登录成功获取 `mmeAuthToken` 后结束，不恢复钥匙串，不读取密码、照片或联系人。
 可选的 Windows 验证码入口会登记设备、查询设备状态和监听 AuthKit 登录请求。
@@ -8,6 +14,10 @@
 不保证本程序出现在 Apple 账号设备列表，也不表示它成为能接收后续 2FA 的受信任设备。
 `state/device.json` 保存稳定认证身份。普通登录的验证码需手动输入；
 Windows 本机验证码入口见下文。
+
+iCloud+ 开通与礼品卡付款准备见 [开通流程](docs/icloud-purchase.md)：官方客户端兑换 → 面板预检查 → 确认订阅 → 核验付费容量。
+
+新增[礼品卡协议兑换](docs/gift-card-protocol.md)：无需打开 Apple Music；会话准备已实测，新的礼品卡实际入账仍待验收。
 
 ## Windows 运行
 
@@ -33,6 +43,22 @@ Windows 本机验证码入口见下文。
 
 程序默认使用公共 anisette 服务池。设备标识及 provisioning 数据会发送给选用的 anisette 服务；
 账号密码和验证码由本程序直接提交 Apple 的登录接口。
+
+### 构建 Store 认证组件
+
+面板的 iCloud+ 购买预检查需要 `bin/storeauth.exe`。在项目目录运行：
+
+```powershell
+.\tools\storeauth\build.ps1
+# 可选：提前下载认证运行时资源，不登录账号或提交购买
+.\tools\storeauth\build.ps1 -Prepare
+```
+
+脚本从独立的 `tools/storeauth` 模块构建组件，默认加载
+`D:\APP\.runtime\appleservices-family-private\environment.ps1`，可用 `-EnvironmentFile` 指定其他环境文件。
+Go 依赖和工具链缓存沿用该文件配置；运行时资源使用 `APPLESERVICES_CACHE_DIR`，
+未设置时缓存到 `D:\APP\.runtime\appleservices-family-private\runtime-cache`，与一键启动面板一致。
+脚本退出时恢复原工作目录和环境变量。更新认证组件后重新构建，再运行 `run-ui.ps1`。
 
 ## 命令行
 
@@ -217,7 +243,23 @@ OpenBubbles 1.18.800.0 Windows 模块。此机器已有对应 Store 包缓存，
 
 原始源码保存在 Git 的初始提交 `d6fb108`，也有 `backups/original-source.zip` 备份。
 
-MIT License；与 Apple 无关联。
+## 许可与使用边界
+
+本仓库从当前版本起采用 [PolyForm Noncommercial License 1.0.0](LICENSE)，属于源码公开
+（source-available），不是 OSI 定义的开源软件。允许个人学习、研究、实验以及许可证列明的
+非商业组织用途；不允许以盈利、收费服务、商业产品、商业内部应用或其他预期商业利益为目的使用。
+需要商业使用时，必须事先取得相关权利人的单独书面授权。
+
+仓库包含此前在 MIT 许可下发布的原始代码和其他独立许可组件；既有授权不能被追溯撤销，
+这些部分继续遵循其原许可证。具体范围与版权通知见[第三方通知](THIRD_PARTY_NOTICES.md)。
+
+本项目与 Apple Inc. 没有隶属、合作、授权、认可或担保关系。软件按“现状”提供，不保证可用、
+安全、准确或持续兼容。使用者须仅操作自己拥有或获明确授权的账号、设备和数据，并自行遵守法律与
+Apple 服务条款；在适用法律允许的最大范围内，作者、维护者和贡献者不承担使用或无法使用本项目
+造成的损失。项目方没有维护、支持或继续公开的义务，可随时限制访问、归档或删除仓库；收到可信的
+权利通知时可先下架相关内容或整个仓库。完整风险边界见[免责声明](DISCLAIMER.md)，投诉处理见
+[权利通知与下架政策](TAKEDOWN.md)。
+
 ## Multiple accounts
 
 Each account must run with its own state directory. This keeps the Apple
