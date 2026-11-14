@@ -1,0 +1,115 @@
+{
+  "platform": "windows/amd64",
+  "resources": [
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-v2/CommerceKit",
+      "sha256": "b84ff12c21987856c0a17b78f1ad82b73195a6dec5f3b208a17d245555a2c8a2",
+      "group": "legacy-sap"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-v2/CommerceCore",
+      "sha256": "c5401e57402230f3c876409d295319ddf1e61287bc882683c5d61277be7bc1f2",
+      "group": "legacy-sap"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-v2/CoreFP",
+      "sha256": "f19141336be4198d0f8991bb00017c915efc7aeaece36c345f7faa1237ea6074",
+      "group": "legacy-sap"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-v2/CoreFP.icxs",
+      "sha256": "473e78af86979f5bd4f6269561caf770b3d16c098d918846eeac8cdd2fe6566a",
+      "group": "legacy-sap"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-storeagent-v1/storeagent",
+      "sha256": "70ce036f9dbcbc04db9511ebd08de0dd3cbc35ccc9d44b089c90170cb5453c59",
+      "group": "legacy-sap"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-macos-27-26A434-arm64-v4/commerce",
+      "sha256": "76de40a4a32f691947cb926ce3b128d2fc446f7cac9755f831c406cf5a316ac9",
+      "group": "storeauth"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-macos-27-26A434-arm64-v4/AppleMediaServices",
+      "sha256": "95f4558aa2c0ccd9f96ed479e336b630b46bf4b4e0baabc1c1ac8c7d55e21ab4",
+      "group": "storeauth"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-macos-27-26A434-arm64-v4/fairplayd",
+      "sha256": "28b4c7b2a5a0409c5020da55fc3984713a8e2b0eec8557076c8717f7166d003e",
+      "group": "storeauth"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-macos-27-26A434-arm64-v4/FairPlayIOKit",
+      "sha256": "47452960ec010d3a80b02cceec73a65f8a9758850fd0fb7b2fdac7a5d1b81025",
+      "group": "storeauth"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-macos-27-26A434-arm64-v4/CoreFP.icxs",
+      "sha256": "cb8f55330ec567da3e692dab5f5388bed0312dd9093340477c5759078cc2aa7b",
+      "group": "storeauth"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-macos-27-26A434-arm64-v4/adid",
+      "sha256": "1fec225b6917206e3d9b00fe636c04878f82bfd06a87a4b6941711de60efab5b",
+      "group": "storeauth"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/sap/apple-assets-macos-27-26A434-arm64-v4/CoreFP",
+      "sha256": "2c30fa2b5f695fd66c0360dce72f54757d03ddb7107549715c12cb359a003b46",
+      "group": "storeauth"
+    },
+    {
+      "root": "project",
+      "path": ".cache/mac-nac-runtime/emulated/nac.py",
+      "sha256": "4690fadf1d46820d92fa28929478d5201bceb905820d07f8bc6d3a35efc343fc",
+      "group": "nac"
+    },
+    {
+      "root": "project",
+      "path": ".cache/mac-nac-runtime/emulated/jelly.py",
+      "sha256": "8335f45e9971566e9803a14270e65aa7a1b8db083456930f17ca467e155cbeb8",
+      "group": "nac"
+    },
+    {
+      "root": "project",
+      "path": ".cache/mac-nac-runtime/emulated/mparser.py",
+      "sha256": "c5365a6e225a9c69235e06aaad73e7b4a00c21292b4be3894c072607e7b4354c",
+      "group": "nac"
+    },
+    {
+      "root": "project",
+      "path": ".cache/mac-nac-runtime/emulated/IMDAppleServices",
+      "sha256": "74c2a8fe826a478f14f6e17b3709a8b315e8c0e0e34e3fba6b9c4eee2f4516e9",
+      "group": "nac"
+    },
+    {
+      "root": "project",
+      "path": ".cache/openbubbles-store/rust_lib_bluebubbles.dll",
+      "sha256": "ca88e816dda449d7ba24d54a5ed709a2d392daeae28c25a61dcd2e7496e44cfe",
+      "group": "native-adi"
+    },
+    {
+      "root": "cache",
+      "path": "ipatool/unicorn/2.1.4/d8f9a89222ffa74493a1d47090e17f8e1db8ac171a3128c6a76a4ea09de11469/libunicorn.dll",
+      "sha256": "d8f9a89222ffa74493a1d47090e17f8e1db8ac171a3128c6a76a4ea09de11469",
+      "group": "sap-engine"
+    }
+  ],
+  "nacSourceRevision": "f205e86bdf1a4ea5414a78985721c721039ada97",
+  "encryptSourceRevision": "be8d3f83be30a88dca26ee7ad1fb862b8af889e9"
+}

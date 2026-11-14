@@ -8,6 +8,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. 'D:\APP\.runtime\appleservices-family-private\environment.ps1'
 $taskExecutable = Join-Path $PSScriptRoot 'bin\login.exe'
 if (-not (Test-Path -LiteralPath $taskExecutable)) {
     New-Item -ItemType Directory -Force -Path (Join-Path $PSScriptRoot 'bin') | Out-Null

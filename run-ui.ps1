@@ -18,22 +18,6 @@ function Assert-DashboardResponse($Response) {
     }
 }
 
-foreach ($relative in @('bin\dashboard.exe', 'bin\trusted-device-gui.exe', 'bin\storeauth.exe',
-        'bin\familyinspect.exe', 'bin\accountsetupcheck.exe', 'bin\nacexchange.exe',
-        '.cache\openbubbles-store\rust_lib_bluebubbles.dll', 'tools\mac-push-check.py')) {
-    if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot $relative) -PathType Leaf)) {
-        throw "Required file missing: $relative"
-    }
-}
-
-$existing = Get-DashboardResponse
-if ($existing) {
-    Assert-DashboardResponse $existing
-    Write-Host "Dashboard already running: $url"
-    if (-not $NoOpen) { Start-Process $url }
-    return
-}
-
 if (-not (Test-Path -LiteralPath $EnvironmentFile -PathType Leaf)) {
     throw "Dependency environment not found: $EnvironmentFile"
 }
@@ -46,6 +30,17 @@ foreach ($command in @('python', 'gcc')) {
     if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
         throw "Required dependency missing: $command"
     }
+}
+
+& python -X utf8 (Join-Path $PSScriptRoot 'tools\check-components.py') --quiet
+if ($LASTEXITCODE -ne 0) { throw 'Local component check failed. See tools/check-components.py for details.' }
+
+$existing = Get-DashboardResponse
+if ($existing) {
+    Assert-DashboardResponse $existing
+    Write-Host "Dashboard already running: $url"
+    if (-not $NoOpen) { Start-Process $url }
+    return
 }
 
 # Credentials are entered in the dashboard, never inherited from this launcher.

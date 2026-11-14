@@ -11,6 +11,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. 'D:\APP\.runtime\appleservices-family-private\environment.ps1'
 $StateDir = [IO.Path]::GetFullPath($StateDir)
 $ADILibrary = [IO.Path]::GetFullPath($ADILibrary)
 $taskExecutable = Join-Path $PSScriptRoot 'bin\trusted-device.exe'

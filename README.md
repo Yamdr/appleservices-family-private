@@ -59,6 +59,29 @@ go build -trimpath -o .\bin\nacexchange.exe ./tools/nacexchange
 一键启动会检查上述文件，已运行的后台也会在执行家庭操作时检查它们。
 仅补齐这些辅助程序后可以直接重试，不必重启账号。
 
+### 检查完整本地依赖
+
+一键启动会执行离线组件检查，覆盖 8 个程序、辅助脚本、固定资源哈希、
+Python 模块和原生库加载，不读取账号文件或访问认证接口。手动检查：
+
+```powershell
+. 'D:\APP\.runtime\appleservices-family-private\environment.ps1'
+python -X utf8 .\tools\check-components.py
+```
+
+首次部署还需准备独立于主程序的 Mac NAC 与商店签名资源。以下命令仅准备代码和公开资源，
+不会接受条款、创建账号身份、认证账号或提交交易：
+
+```powershell
+python -X utf8 .\tools\prepare-nac-runtime.py
+go run ./tools/prepare-sap-assets
+.\tools\storeauth\build.ps1 -Prepare
+```
+
+NAC 来源修订与资源哈希固定在准备工具和 `tools/runtime-components.json` 中；
+不下载或复用上游 `data.plist` 硬件资料。当前默认使用账号独立的 Mac 推送路径，
+检查结果中的 `icloud_windows_native_push` 仅表示可选 Windows 原生推送后端是否注册。
+
 ### 构建 Store 认证组件
 
 面板的 iCloud+ 购买预检查需要 `bin/storeauth.exe`。在项目目录运行：

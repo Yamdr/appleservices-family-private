@@ -8,6 +8,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. 'D:\APP\.runtime\appleservices-family-private\environment.ps1'
+& python -X utf8 (Join-Path $PSScriptRoot 'tools\check-components.py') --quiet
+if ($LASTEXITCODE -ne 0) { throw 'Local component check failed.' }
 $accounts = @(Get-Content -LiteralPath $AccountsFile -Raw | ConvertFrom-Json)
 if ($accounts.Count -eq 0) { throw 'Accounts file is empty.' }
 $worker = Join-Path $PSScriptRoot 'bin\trusted-device-gui.exe'
